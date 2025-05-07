@@ -98,6 +98,14 @@ st.markdown("""
         margin-bottom: 8px;
         color: #BBDEFB;
     }
+    /* Style warning */
+    .warning-note {
+        background-color: #FFA000;
+        color: #000;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 16px;
+    }
 </style>
 
 <h1 class="main-header">PubMed Month Extractor</h1>
@@ -110,7 +118,7 @@ ESearch_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFetch_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 BATCH_SIZE = 500  # maximum records per EFetch call
 TOOL_NAME = "PubMedMonthExtractor"
-CONTACT_EMAIL = "angshuman@rhenix.org"  # Replace with your email
+CONTACT_EMAIL = "your-email@example.com"  # Replace with your email
 MAX_RETRIES = 3  # Maximum number of retry attempts for API calls
 
 # The consistent API key to use for all requests
@@ -199,6 +207,46 @@ def parse_month(mstr):
     
     return 1  # Default to January if no match
 
+def is_future_date(date_str):
+    """Check if a date string is in the future"""
+    try:
+        date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        return date_obj > today
+    except (ValueError, TypeError):
+        return False
+
+def validate_article_date(article, year, month, start_day, end_day):
+    """
+    Validate that the article's publication date falls within the requested range.
+    Returns True if valid, False otherwise.
+    """
+    # Get the publication date from the article
+    pub_date = article.get("PublicationDate", "")
+    
+    # Skip if no publication date
+    if not pub_date:
+        return False
+    
+    try:
+        # Parse the date
+        pub_date_obj = datetime.datetime.strptime(pub_date, "%Y-%m-%d").date()
+        
+        # Create date range boundaries
+        start_date = datetime.date(year, month, start_day)
+        end_date = datetime.date(year, month, end_day)
+        
+        # Check if date is in the future (beyond today)
+        today = datetime.date.today()
+        if pub_date_obj > today:
+            return False
+        
+        # Check if publication date is within range
+        return start_date <= pub_date_obj <= end_date
+    except ValueError:
+        # If date parsing fails, exclude the article
+        return False
+
 # ------------------ Core Fetch Functions ------------------
 
 def get_total_record_count(year, month):
@@ -232,6 +280,16 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
     # Build date range for this specific period
     start = datetime.date(year, month, start_day)
     end = datetime.date(year, month, end_day)
+    
+    # Ensure end date is not in the future
+    today = datetime.date.today()
+    if end > today:
+        end = today
+        if start > today:
+            if status_callback:
+                status_callback(f"Warning: The requested date range is in the future. No articles will be available.")
+            return []
+    
     ds, de = start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
     term = f'"{ds}"[pdat] : "{de}"[pdat]'
     
@@ -263,7 +321,7 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
                 status_callback("Error: WebEnv or QueryKey not found in search results")
             return []
         
-        records = []
+        all_records = []
         batch_count = math.ceil(count / BATCH_SIZE)
         
         # Fetch records in batches
@@ -293,7 +351,7 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
                     journal = get_text(art, "./MedlineCitation/Article/Journal/Title")
 
                     # Publication date parsing with better fallbacks
-                    # First try ArticleDate
+                    # First try ArticleDate - most accurate electronic publication date
                     y = get_text(art, "./MedlineCitation/Article/ArticleDate/Year")
                     m = get_text(art, "./MedlineCitation/Article/ArticleDate/Month")
                     d = get_text(art, "./MedlineCitation/Article/ArticleDate/Day")
@@ -351,7 +409,7 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
                     
                     author_str = ", ".join(authors)
 
-                    records.append({
+                    all_records.append({
                         "PMID": pmid,
                         "Journal": journal,
                         "Title": title,
@@ -374,10 +432,30 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
                 # Continue with next batch instead of failing the entire chunk
                 continue
         
-        if status_callback:
-            status_callback(f"Successfully retrieved {len(records)} articles from {ds} to {de}")
+        # Filter records by actual publication date to ensure they're within the requested range
+        valid_records = []
+        future_dates = 0
+        out_of_range = 0
         
-        return records
+        for record in all_records:
+            if is_future_date(record.get("PublicationDate", "")):
+                future_dates += 1
+                continue
+                
+            if validate_article_date(record, year, month, start_day, end_day):
+                valid_records.append(record)
+            else:
+                out_of_range += 1
+        
+        # Report filtering results
+        if status_callback:
+            if future_dates > 0:
+                status_callback(f"Removed {future_dates} articles with future publication dates")
+            if out_of_range > 0:
+                status_callback(f"Removed {out_of_range} articles with dates outside the requested range")
+            status_callback(f"Successfully retrieved {len(valid_records)} valid articles from {ds} to {de}")
+        
+        return valid_records
         
     except Exception as e:
         logger.error(f"Error in fetch_pubmed_by_date_range: {str(e)}")
@@ -391,6 +469,17 @@ def calculate_date_ranges(year, month):
     Returns a list of (start_day, end_day) tuples.
     """
     days_in_month = calendar.monthrange(year, month)[1]
+    
+    # Check if requested month is in the future
+    today = datetime.date.today()
+    if year > today.year or (year == today.year and month > today.month):
+        # Future month, return empty list
+        return []
+    
+    # If the requested month is current month, limit to today's date
+    if year == today.year and month == today.month:
+        days_in_month = min(days_in_month, today.day)
+    
     date_ranges = []
     
     for start_day in range(1, days_in_month + 1, DAYS_PER_CHUNK):
@@ -522,9 +611,9 @@ with st.sidebar:
     st.markdown(f"""
     - This app divides the month into {DAYS_PER_CHUNK}-day periods
     - Each chunk processes a different date range (no overlap)
-    - 30-day months will generate 6 chunks
-    - 31-day months will generate 7 chunks
-    - This ensures all articles are retrieved reliably
+    - Articles are filtered to ensure publication dates match the requested range
+    - Future publication dates are automatically excluded
+    - Only articles with valid, verified dates are included
     """)
 
 # ------------------ Main App Logic ------------------
@@ -532,86 +621,105 @@ with st.sidebar:
 if submitted:
     # Get total record count first
     try:
-        with st.spinner("Checking total article count..."):
-            total_count = get_total_record_count(year, month)
-            
-        if total_count == 0:
-            st.info(f"📭 No publications found for {calendar.month_name[month]} {year}.")
+        # Check if the requested month is in the future
+        today = datetime.date.today()
+        if year > today.year or (year == today.year and month > today.month):
+            st.warning(f"⚠️ {calendar.month_name[month]} {year} is in the future. No articles are available yet.")
         else:
-            st.markdown("---")
-            st.success(f"Found {total_count:,} articles for {calendar.month_name[month]} {year}")
-            
-            # Calculate date ranges for this month
-            date_ranges = calculate_date_ranges(year, month)
-            
-            st.info(f"Articles will be downloaded in {len(date_ranges)} separate files by date ranges")
-            
-            all_chunks_article_count = 0
-            
-            for chunk_idx, (start_day, end_day) in enumerate(date_ranges):
-                st.markdown(f"### Processing Date Range {start_day}-{end_day} {calendar.month_name[month]} {year}")
+            with st.spinner("Checking total article count..."):
+                total_count = get_total_record_count(year, month)
                 
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
+            if total_count == 0:
+                st.info(f"📭 No publications found for {calendar.month_name[month]} {year}.")
+            else:
+                st.markdown("---")
+                st.success(f"Found {total_count:,} articles for {calendar.month_name[month]} {year}")
                 
-                # Fetch articles for this date range
-                try:
-                    records = fetch_pubmed_by_date_range(
-                        year, month, start_day, end_day,
-                        progress_callback=lambda frac: progress_bar.progress(frac),
-                        status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
-                    )
+                # Display warning for current month
+                if year == today.year and month == today.month:
+                    st.markdown(f"""
+                    <div class="warning-note">
+                    ⚠️ Note: {calendar.month_name[month]} {year} is the current month. Only articles published up to today ({today.strftime('%Y-%m-%d')}) will be available.
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Calculate date ranges for this month
+                date_ranges = calculate_date_ranges(year, month)
+                
+                if not date_ranges:
+                    st.warning(f"No valid date ranges for {calendar.month_name[month]} {year}. This may be a future month.")
+                else:
+                    st.info(f"Articles will be downloaded in {len(date_ranges)} separate files by date ranges")
                     
-                    # Convert to DataFrame
-                    df = pd.DataFrame(records)
+                    all_chunks_article_count = 0
                     
-                    if not df.empty:
-                        # Remove authors column if not requested
-                        if not include_authors and "Authors" in df.columns:
-                            df = df.drop(columns=["Authors"])
+                    for chunk_idx, (start_day, end_day) in enumerate(date_ranges):
+                        st.markdown(f"### Processing Date Range {start_day}-{end_day} {calendar.month_name[month]} {year}")
                         
-                        all_chunks_article_count += len(df)
+                        progress_bar = st.progress(0.0)
+                        status_text = st.empty()
                         
-                        # Create Excel file
-                        excel_data = create_excel(df, include_styling)
+                        # Fetch articles for this date range
+                        try:
+                            records = fetch_pubmed_by_date_range(
+                                year, month, start_day, end_day,
+                                progress_callback=lambda frac: progress_bar.progress(frac),
+                                status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
+                            )
+                            
+                            # Convert to DataFrame
+                            df = pd.DataFrame(records)
+                            
+                            if not df.empty:
+                                # Remove authors column if not requested
+                                if not include_authors and "Authors" in df.columns:
+                                    df = df.drop(columns=["Authors"])
+                                
+                                all_chunks_article_count += len(df)
+                                
+                                # Create Excel file
+                                excel_data = create_excel(df, include_styling)
+                                
+                                # Format date range for display
+                                date_format = lambda d: f"{year}-{month:02d}-{d:02d}"
+                                start_date = date_format(start_day)
+                                end_date = date_format(end_day)
+                                
+                                # Create download section
+                                st.markdown(f"""
+                                <div class="chunk-card">
+                                    <div class="chunk-title">Date Range: {start_date} to {end_date}</div>
+                                    <p>Contains {len(df):,} articles</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                st.download_button(
+                                    label=f"⬇️ Download {start_day}-{end_day} {calendar.month_name[month]} ({len(df):,} articles)",
+                                    data=excel_data,
+                                    file_name=f"pubmed_{calendar.month_name[month].lower()}{year}_{start_day}-{end_day}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"download_btn_{chunk_idx}"
+                                )
+                                
+                                # Preview data
+                                with st.expander(f"Preview {start_day}-{end_day} {calendar.month_name[month]}"):
+                                    df_display = df.copy()
+                                    st.dataframe(df_display.head(5), use_container_width=True)
+                            else:
+                                st.warning(f"No valid articles found for days {start_day}-{end_day}")
                         
-                        # Format date range for display
-                        date_format = lambda d: f"{year}-{month:02d}-{d:02d}"
-                        start_date = date_format(start_day)
-                        end_date = date_format(end_day)
-                        
-                        # Create download section
-                        st.markdown(f"""
-                        <div class="chunk-card">
-                            <div class="chunk-title">Date Range: {start_date} to {end_date}</div>
-                            <p>Contains {len(df):,} articles</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        st.download_button(
-                            label=f"⬇️ Download {start_day}-{end_day} {calendar.month_name[month]} ({len(df):,} articles)",
-                            data=excel_data,
-                            file_name=f"pubmed_{calendar.month_name[month].lower()}{year}_{start_day}-{end_day}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"download_btn_{chunk_idx}"
-                        )
-                        
-                        # Preview data
-                        with st.expander(f"Preview {start_day}-{end_day} {calendar.month_name[month]}"):
-                            df_display = df.copy()
-                            st.dataframe(df_display.head(5), use_container_width=True)
-                    else:
-                        st.warning(f"No articles found for days {start_day}-{end_day}")
-                
-                except Exception as e:
-                    st.error(f"🛑 Error processing days {start_day}-{end_day}: {str(e)}")
-                    logger.error(f"Error processing days {start_day}-{end_day}: {str(e)}")
-                    continue
-            
-            # Show summary
-            st.markdown("---")
-            percent_retrieved = min(100, (all_chunks_article_count / total_count) * 100)
-            st.success(f"Successfully retrieved {all_chunks_article_count:,} articles ({percent_retrieved:.1f}% of total {total_count:,})")
+                        except Exception as e:
+                            st.error(f"🛑 Error processing days {start_day}-{end_day}: {str(e)}")
+                            logger.error(f"Error processing days {start_day}-{end_day}: {str(e)}")
+                            continue
+                    
+                    # Show summary
+                    st.markdown("---")
+                    percent_retrieved = min(100, (all_chunks_article_count / total_count) * 100)
+                    st.success(f"Successfully retrieved {all_chunks_article_count:,} valid articles ({percent_retrieved:.1f}% of total {total_count:,})")
+                    
+                    if all_chunks_article_count < total_count:
+                        st.info("Note: The difference between the total count and retrieved articles is due to date filtering to ensure accurate results.")
             
     except Exception as e:
         st.error(f"🛑 An error occurred: {str(e)}")
