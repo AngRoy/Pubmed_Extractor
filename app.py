@@ -27,7 +27,7 @@ logger = logging.getLogger("pubmed_extractor")
 # ------------------ Page Config & Styling ------------------
 
 st.set_page_config(
-    page_title="PubMed Month-to-Daily Extractor",
+    page_title="PubMed Sequential Daily Extractor",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -124,17 +124,25 @@ st.markdown("""
         margin-top: 8px;
         display: inline-block;
     }
-    /* Progress indicator */
+    /* Processing indicator */
     .processing-header {
         margin-top: 1.5rem;
         margin-bottom: 0.5rem;
         color: #64B5F6;
         font-size: 1.2rem;
     }
+    /* Progress indicator for each day */
+    .day-progress {
+        margin-top: 10px;
+        margin-bottom: 20px;
+        padding: 10px;
+        background-color: #1A1A1A;
+        border-radius: 8px;
+    }
 </style>
 
-<h1 class="main-header">PubMed Month-to-Daily Extractor</h1>
-<p class="text-centered">Select a month & year to automatically fetch all PubMed articles published each day</p>
+<h1 class="main-header">PubMed Sequential Daily Extractor</h1>
+<p class="text-centered">Select a month & year to download PubMed articles published each day, one day at a time</p>
 """, unsafe_allow_html=True)
 
 # ------------------ PubMed API Config ------------------
@@ -154,8 +162,14 @@ if 'day_data' not in st.session_state:
     st.session_state.day_data = {}
 if 'selected_month' not in st.session_state:
     st.session_state.selected_month = None
+if 'current_day' not in st.session_state:
+    st.session_state.current_day = None
 if 'days_processed' not in st.session_state:
-    st.session_state.days_processed = 0
+    st.session_state.days_processed = []
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
+if 'pending_days' not in st.session_state:
+    st.session_state.pending_days = []
 
 # ------------------ Helper Functions ------------------
 
@@ -276,6 +290,26 @@ def validate_article_date(article, year, month, day):
         # If date parsing fails, exclude the article
         return False
 
+def extract_doi(article_element):
+    """Extract DOI from PubMed article XML"""
+    # Look for DOI in ArticleId elements with IdType="doi"
+    doi_element = article_element.find(".//ArticleId[@IdType='doi']")
+    if doi_element is not None and doi_element.text:
+        return doi_element.text.strip()
+    
+    # Alternative location: ELocationID with EIdType="doi"
+    doi_location = article_element.find(".//ELocationID[@EIdType='doi']")
+    if doi_location is not None and doi_location.text:
+        return doi_location.text.strip()
+    
+    # Look in the abstract text for DOI patterns
+    abstract = get_text(article_element, "./MedlineCitation/Article/Abstract/AbstractText", "")
+    doi_match = re.search(r'(10\.\d{4,}(?:\.\d+)*\/\S+[^;,.\s])', abstract)
+    if doi_match:
+        return doi_match.group(1)
+    
+    return ""  # Return empty string if DOI not found
+
 # ------------------ Core Fetch Functions ------------------
 
 def get_day_article_count(year, month, day):
@@ -382,6 +416,7 @@ def fetch_pubmed_for_day(year, month, day, progress_callback=None, status_callba
                     pmid = get_text(art, "./MedlineCitation/PMID")
                     title = get_text(art, "./MedlineCitation/Article/ArticleTitle")
                     journal = get_text(art, "./MedlineCitation/Article/Journal/Title")
+                    doi = extract_doi(art)  # Extract DOI
 
                     # Publication date parsing with better fallbacks
                     # First try ArticleDate - most accurate electronic publication date
@@ -419,37 +454,49 @@ def fetch_pubmed_for_day(year, month, day, progress_callback=None, status_callba
                     except (ValueError, TypeError):
                         pubdate = ""
 
-                    # Extract abstract - handle multiple AbstractText elements
-                    abs_nodes = art.findall("./MedlineCitation/Article/Abstract/AbstractText")
-                    abstract = " ".join(a.text.strip() for a in abs_nodes if a.text) if abs_nodes else ""
-
-                    # Author extraction
-                    authors = []
-                    for author in art.findall("./MedlineCitation/Article/AuthorList/Author"):
-                        last_name = get_text(author, "./LastName")
-                        fore_name = get_text(author, "./ForeName")
-                        
-                        # If CollectiveName exists, use that
-                        collective = get_text(author, "./CollectiveName")
-                        if collective:
-                            authors.append(collective)
-                        elif last_name and fore_name:
-                            authors.append(f"{last_name} {fore_name}")
-                        elif last_name:
-                            authors.append(last_name)
-                        elif fore_name:
-                            authors.append(fore_name)
-                    
-                    author_str = ", ".join(authors)
-
-                    all_records.append({
+                    # Initialize record with basic article info
+                    record = {
                         "PMID": pmid,
                         "Journal": journal,
                         "Title": title,
-                        "Authors": author_str,
                         "PublicationDate": pubdate,
-                        "Abstract": abstract
-                    })
+                        "DOI": doi
+                    }
+                    
+                    # Process authors and their affiliations separately
+                    author_nodes = art.findall("./MedlineCitation/Article/AuthorList/Author")
+                    
+                    for idx, author in enumerate(author_nodes, 1):
+                        # Get author name components
+                        last_name = get_text(author, "./LastName")
+                        fore_name = get_text(author, "./ForeName")
+                        
+                        # Collective name if this is a group author
+                        collective = get_text(author, "./CollectiveName")
+                        
+                        # Format the author name
+                        if collective:
+                            author_name = collective
+                        elif last_name and fore_name:
+                            author_name = f"{last_name} {fore_name}"
+                        elif last_name:
+                            author_name = last_name
+                        elif fore_name:
+                            author_name = fore_name
+                        else:
+                            author_name = ""
+                            
+                        # Get author affiliation
+                        affiliation = ""
+                        aff_nodes = author.findall("./AffiliationInfo/Affiliation")
+                        if aff_nodes:
+                            affiliation = "; ".join([aff.text.strip() for aff in aff_nodes if aff.text])
+                        
+                        # Add to record
+                        record[f"Author{idx}"] = author_name
+                        record[f"Affiliation{idx}"] = affiliation
+
+                    all_records.append(record)
 
                 # Update progress
                 if progress_callback:
@@ -555,6 +602,14 @@ def create_excel(df, include_styling=True):
                     'border': 1
                 })
                 
+                url_format = workbook.add_format({
+                    'text_wrap': True,
+                    'valign': 'top',
+                    'border': 1,
+                    'color': '#0066CC',
+                    'underline': True
+                })
+                
                 # Apply header format
                 for col_num, value in enumerate(df.columns.values):
                     worksheet.write(0, col_num, value, header_format)
@@ -570,24 +625,37 @@ def create_excel(df, include_styling=True):
                         max_width = max(max_width, width)
                     
                     # Set default widths for specific columns
-                    if col == 'Abstract':
-                        max_width = 80
-                    elif col == 'Title':
+                    if col == 'Title':
                         max_width = 50
                     elif col == 'Journal':
                         max_width = 30
-                    elif col == 'Authors':
-                        max_width = 40
+                    elif col.startswith('Author'):
+                        max_width = 20
+                    elif col.startswith('Affiliation'):
+                        max_width = 30
                     elif col == 'PMID':
                         max_width = 12
+                    elif col == 'DOI':
+                        max_width = 25
                     
                     # Ensure a minimum width and cap maximum width
                     max_width = max(10, min(max_width, 100))
                     worksheet.set_column(i, i, max_width)
                 
-                # Apply row formatting
-                for row_num in range(1, len(df) + 1):
-                    worksheet.set_row(row_num, None, row_format)
+                # Apply row formatting and add DOI hyperlinks
+                doi_col_idx = -1
+                if 'DOI' in df.columns:
+                    doi_col_idx = df.columns.get_loc('DOI')
+                
+                for row_num, row_data in enumerate(df.itertuples(index=False), 1):
+                    for col_idx, value in enumerate(row_data):
+                        if col_idx == doi_col_idx and value:
+                            # Add hyperlink for DOI column
+                            doi_url = f"https://doi.org/{value}" if not value.startswith('http') else value
+                            worksheet.write_url(row_num, col_idx, doi_url, url_format, value)
+                        else:
+                            # Normal cell formatting
+                            worksheet.write(row_num, col_idx, value, row_format)
                 
                 # Freeze top row
                 worksheet.freeze_panes(1, 0)
@@ -605,6 +673,25 @@ def create_excel(df, include_styling=True):
         df.to_excel(output, index=False)
         output.seek(0)
         return output.getvalue()
+
+def process_next_day():
+    """Process the next day in the queue"""
+    # If not processing or no pending days, do nothing
+    if not st.session_state.processing or not st.session_state.pending_days:
+        st.session_state.current_day = None
+        st.session_state.processing = False
+        return
+    
+    # Get the next day to process
+    year, month, day = st.session_state.pending_days.pop(0)
+    st.session_state.current_day = (year, month, day)
+    
+    # Mark as complete after processing
+    st.session_state.days_processed.append((year, month, day))
+    
+    # If no more days, mark as done
+    if not st.session_state.pending_days:
+        st.session_state.processing = False
 
 # ------------------ Sidebar Form ------------------
 
@@ -635,7 +722,6 @@ with st.sidebar:
         # Additional options
         include_styling = st.checkbox("Include Excel styling", value=True, 
                                      help="Better formatting, but may be slower for large datasets")
-        include_authors = st.checkbox("Include Authors", value=True)
         
         submitted = st.form_submit_button("Fetch All Days")
     
@@ -643,22 +729,30 @@ with st.sidebar:
     if st.button("Reset All Data"):
         st.session_state.day_data = {}
         st.session_state.selected_month = None
-        st.session_state.days_processed = 0
+        st.session_state.current_day = None
+        st.session_state.days_processed = []
+        st.session_state.processing = False
+        st.session_state.pending_days = []
         st.success("All cached data has been cleared!")
     
     # PubMed API Info
     st.markdown("---")
-    st.markdown("### About Month Processing")
+    st.markdown("### About Sequential Processing")
     st.markdown("""
-    - All days in the selected month will be processed automatically
-    - Each file contains articles from a single day
-    - Files are named as DD_MM_YYYY.xlsx (e.g., 07_05_2023.xlsx)
-    - All days remain available for download after processing
+    - Each day is processed individually
+    - Download button appears as soon as a day is processed
+    - Each file contains only articles from a single day
+    - Files are named as DD_MM_YYYY.xlsx
+    - DOI links included in the output
     """)
 
 # ------------------ Main App Logic ------------------
 
 if submitted:
+    # Reset processing state
+    st.session_state.days_processed = []
+    st.session_state.processing = True
+    
     # Check if month is in the future
     selected_date = datetime.date(year, month, 1)
     today = datetime.date.today()
@@ -667,6 +761,7 @@ if submitted:
     
     if year > today.year or (year == today.year and month > today.month):
         st.warning(f"⚠️ {calendar.month_name[month]} {year} is in the future. No articles are available yet.")
+        st.session_state.processing = False
     else:
         # Store the selected month for session state
         st.session_state.selected_month = month_key
@@ -677,9 +772,10 @@ if submitted:
             
             if not valid_days:
                 st.warning(f"No valid days for {calendar.month_name[month]} {year}.")
+                st.session_state.processing = False
             else:
-                # Fetch data for all days
-                st.markdown(f"## Processing {calendar.month_name[month]} {year}")
+                # Create list of days to process
+                st.session_state.pending_days = [(year, month, day) for day in valid_days]
                 
                 if today.year == year and today.month == month:
                     st.markdown(f"""
@@ -688,124 +784,101 @@ if submitted:
                     </div>
                     """, unsafe_allow_html=True)
                 
-                # Create processing area with progress
-                st.markdown('<div class="processing-header">Processing each day:</div>', unsafe_allow_html=True)
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-                
-                # Track total articles found
-                total_articles = 0
-                
-                # Process each day in the month
-                for i, day in enumerate(valid_days):
-                    day_key = f"{day:02d}_{month:02d}_{year}"
-                    
-                    # Update overall progress
-                    progress_bar.progress(i / len(valid_days))
-                    
-                    try:
-                        # Fetch data for this day
-                        status_text.markdown(f'<p class="status-message">Processing day {day:02d}/{month:02d}/{year}</p>', unsafe_allow_html=True)
-                        
-                        records = fetch_pubmed_for_day(
-                            year, month, day,
-                            status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
-                        )
-                        
-                        total_articles += len(records)
-                        
-                    except Exception as e:
-                        st.error(f"🛑 Error processing {day:02d}/{month:02d}/{year}: {str(e)}")
-                        logger.error(f"Error processing {day:02d}/{month:02d}/{year}: {str(e)}")
-                        continue
-                
-                # Update final progress
-                progress_bar.progress(1.0)
-                status_text.markdown(f'<p class="status-message">All {len(valid_days)} days processed successfully!</p>', unsafe_allow_html=True)
-                
-                # Show summary of processing
-                st.success(f"Found {total_articles:,} articles across {len(valid_days)} days in {calendar.month_name[month]} {year}")
-                
-                # Display all days in a grid for downloading
-                st.markdown("## Download Files by Day")
-                st.markdown('<div class="day-cards-container">', unsafe_allow_html=True)
-                
-                # Create a card for each day with a download button
-                for day in valid_days:
-                    day_key = f"{day:02d}_{month:02d}_{year}"
-                    
-                    if day_key in st.session_state.day_data:
-                        records = st.session_state.day_data[day_key]
-                        
-                        # Create DataFrame
-                        df = pd.DataFrame(records)
-                        
-                        # Remove authors column if not requested
-                        if not df.empty and not include_authors and "Authors" in df.columns:
-                            df = df.drop(columns=["Authors"])
-                        
-                        # Create day card
-                        st.markdown(f"""
-                        <div class="day-card">
-                            <div class="day-title">{day:02d}/{month:02d}/{year}</div>
-                            <div class="count-badge">{len(records)} articles</div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Create Excel file for download
-                        excel_data = create_excel(df, include_styling)
-                        
-                        # Download button
-                        st.download_button(
-                            label=f"⬇️ Download",
-                            data=excel_data,
-                            file_name=f"{day:02d}_{month:02d}_{year}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"download_btn_{day}"
-                        )
-                        
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    else:
-                        # Create empty card for days with no data
-                        st.markdown(f"""
-                        <div class="day-card">
-                            <div class="day-title">{day:02d}/{month:02d}/{year}</div>
-                            <div class="count-badge">0 articles</div>
-                            <p>No data available</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
+                # Start processing the first day
+                process_next_day()
                 
         except Exception as e:
             st.error(f"🛑 An error occurred: {str(e)}")
             logger.error(f"Error in main app: {str(e)}")
+            st.session_state.processing = False
 
-# Display previously processed data if available but not newly submitted
-elif st.session_state.selected_month is not None:
-    # Parse out the month and year from the session key
+# Initialize container for cards
+download_container = st.container()
+
+# Processing area for current day
+if st.session_state.processing and st.session_state.current_day:
+    year, month, day = st.session_state.current_day
+    date_key = f"{day:02d}_{month:02d}_{year}"
+    
+    st.markdown(f"## Processing {calendar.month_name[month]} {year}")
+    st.markdown(f'<div class="processing-header">Currently processing: {day:02d}/{month:02d}/{year}</div>', unsafe_allow_html=True)
+    
+    # Progress bar and status for current day
+    st.markdown('<div class="day-progress">', unsafe_allow_html=True)
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Process the current day
     try:
-        month, year = map(int, st.session_state.selected_month.split('_'))
-        valid_days = get_valid_days(year, month)
+        records = fetch_pubmed_for_day(
+            year, month, day,
+            progress_callback=lambda frac: progress_bar.progress(frac),
+            status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
+        )
         
-        if valid_days:
-            # Display the download grid for previously processed data
-            st.markdown(f"## Download Files for {calendar.month_name[month]} {year}")
-            st.markdown('<div class="day-cards-container">', unsafe_allow_html=True)
+        # Create DataFrame
+        df = pd.DataFrame(records)
+        
+        # Reorder columns to put PMIDs and DOIs first
+        if not df.empty:
+            cols = df.columns.tolist()
+            ordered_cols = []
             
-            for day in valid_days:
-                day_key = f"{day:02d}_{month:02d}_{year}"
+            # First add key identifiers
+            for col in ['PMID', 'DOI', 'Title', 'Journal', 'PublicationDate']:
+                if col in cols:
+                    ordered_cols.append(col)
+                    cols.remove(col)
+            
+            # Then add authors
+            author_cols = sorted([c for c in cols if c.startswith('Author')])
+            for col in author_cols:
+                ordered_cols.append(col)
+                cols.remove(col)
+            
+            # Then add affiliations
+            affiliation_cols = sorted([c for c in cols if c.startswith('Affiliation')])
+            for col in affiliation_cols:
+                ordered_cols.append(col)
+                cols.remove(col)
+            
+            # Add any remaining columns
+            ordered_cols.extend(cols)
+            
+            # Reorder the DataFrame
+            df = df[ordered_cols]
+        
+        # Trigger processing of the next day in the queue
+        process_next_day()
+        
+    except Exception as e:
+        st.error(f"🛑 Error processing {day:02d}/{month:02d}/{year}: {str(e)}")
+        logger.error(f"Error processing {day:02d}/{month:02d}/{year}: {str(e)}")
+        # Continue with next day
+        process_next_day()
+
+# Display all processed days
+with download_container:
+    if st.session_state.days_processed:
+        month, year = None, None
+        for y, m, d in st.session_state.days_processed:
+            if month is None:
+                month, year = m, y
+                st.markdown(f"## Downloaded Days for {calendar.month_name[month]} {year}")
+                st.markdown('<div class="day-cards-container">', unsafe_allow_html=True)
+        
+        # Create cards for all processed days
+        for year, month, day in st.session_state.days_processed:
+            date_key = f"{day:02d}_{month:02d}_{year}"
+            
+            if date_key in st.session_state.day_data:
+                records = st.session_state.day_data[date_key]
                 
-                if day_key in st.session_state.day_data:
-                    records = st.session_state.day_data[day_key]
-                    
-                    # Create DataFrame
-                    df = pd.DataFrame(records)
-                    
-                    # Remove authors column if needed
-                    include_authors = True  # Default value since we don't know user preference now
-                    if not df.empty and not include_authors and "Authors" in df.columns:
-                        df = df.drop(columns=["Authors"])
-                    
+                # Create DataFrame
+                df = pd.DataFrame(records)
+                
+                if not df.empty:
                     # Create day card
                     st.markdown(f"""
                     <div class="day-card">
@@ -814,7 +887,7 @@ elif st.session_state.selected_month is not None:
                     """, unsafe_allow_html=True)
                     
                     # Create Excel file for download
-                    excel_data = create_excel(df, include_styling=True)
+                    excel_data = create_excel(df, include_styling)
                     
                     # Download button
                     st.download_button(
@@ -822,15 +895,27 @@ elif st.session_state.selected_month is not None:
                         data=excel_data,
                         file_name=f"{day:02d}_{month:02d}_{year}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_btn_{day}"
+                        key=f"download_btn_{date_key}"
                     )
                     
                     st.markdown("</div>", unsafe_allow_html=True)
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-    except Exception as e:
-        logger.error(f"Error displaying previous data: {str(e)}")
-        # Don't show an error to the user, just silently fail
+                else:
+                    # Create empty card for days with no data
+                    st.markdown(f"""
+                    <div class="day-card">
+                        <div class="day-title">{day:02d}/{month:02d}/{year}</div>
+                        <div class="count-badge">0 articles</div>
+                        <p>No data available</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Show summary stats if processing is complete
+        if not st.session_state.processing:
+            total_articles = sum(len(st.session_state.day_data.get(f"{d:02d}_{m:02d}_{y}", [])) 
+                                for y, m, d in st.session_state.days_processed)
+            st.success(f"Processed {len(st.session_state.days_processed)} days with {total_articles} total articles")
 
 # ------------------ Footer ------------------
 
