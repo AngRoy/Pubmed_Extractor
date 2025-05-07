@@ -110,17 +110,14 @@ ESearch_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFetch_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 BATCH_SIZE = 500  # maximum records per EFetch call
 TOOL_NAME = "PubMedMonthExtractor"
-CONTACT_EMAIL = "angshuman@rhenix.org"
+CONTACT_EMAIL = "angshuman@rhenix.org"  # Replace with your email
 MAX_RETRIES = 3  # Maximum number of retry attempts for API calls
 
 # The consistent API key to use for all requests
 API_KEY = "29d53109210e6c9cb4249426d56ada159108"
 
-# Max articles we can retrieve in a single chunk - PubMed API limit
-CHUNK_SIZE = 10000  # API limitation for retstart
-
-# Sort fields available in PubMed
-SORT_FIELDS = ["pub date", "first author", "last author", "journal", "title", "relevance"]
+# Number of days per chunk
+DAYS_PER_CHUNK = 5
 
 # ------------------ Helper Functions ------------------
 
@@ -145,16 +142,7 @@ def get_xml(base_url, params, retry_count=0):
         response.raise_for_status()
         return ET.fromstring(response.text)
     except requests.HTTPError as e:
-        # Handle pagination limits 
-        if (e.response.status_code == 400 and 
-            "retstart" in api_params and 
-            int(api_params["retstart"]) >= CHUNK_SIZE):
-            logger.warning(f"Hit API limit at record {api_params['retstart']}")
-            raise ValueError(
-                f"PubMed API limit reached at record {api_params['retstart']}. "
-                "Each chunk is limited to 10,000 records due to PubMed API limitations."
-            )
-        elif retry_count < MAX_RETRIES:
+        if retry_count < MAX_RETRIES:
             # Exponential backoff
             wait_time = 2 ** retry_count
             logger.warning(f"API request failed: {str(e)}. Retrying in {wait_time} seconds...")
@@ -217,7 +205,7 @@ def get_total_record_count(year, month):
     """
     Get the total number of PubMed articles for the given year/month.
     """
-    # Build date range
+    # Build date range for the entire month
     start = datetime.date(year, month, 1)
     last_day = calendar.monthrange(year, month)[1]
     end = datetime.date(year, month, last_day)
@@ -230,49 +218,33 @@ def get_total_record_count(year, month):
             "db": "pubmed", 
             "term": term, 
             "retmax": 0,
-            "api_key": API_KEY
         })
         return int(get_text(root, "./Count", "0"))
     except Exception as e:
         logger.error(f"Error getting total record count: {str(e)}")
         raise
 
-def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, progress_callback=None, status_callback=None):
+def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callback=None, status_callback=None):
     """
-    Fetch a chunk of PubMed articles published in the given year/month using sorting to paginate.
-    This approach allows retrieving articles beyond the 10,000 record limit.
-    
-    Each chunk is retrieved with a different sort order (or direction) to get different segments
-    of the total result set.
+    Fetch PubMed articles published in a specific date range within a month.
+    This allows retrieving different subsets of articles that don't overlap.
     """
-    # Build date range
-    start = datetime.date(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    end = datetime.date(year, month, last_day)
+    # Build date range for this specific period
+    start = datetime.date(year, month, start_day)
+    end = datetime.date(year, month, end_day)
     ds, de = start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
     term = f'"{ds}"[pdat] : "{de}"[pdat]'
     
-    # Determine sort parameters for this chunk
-    # For chunks beyond the number of sort fields, we'll cycle through them
-    # and alternate ascending/descending order
-    sort_idx = chunk_idx % len(SORT_FIELDS)
-    sort_order = "asc" if (chunk_idx // len(SORT_FIELDS)) % 2 == 0 else "desc"
-    
-    # Use the selected sort field plus an alternating direction
-    current_sort = f"{SORT_FIELDS[sort_idx]} {sort_order}"
-    
     if status_callback:
-        status_callback(f"Fetching chunk {chunk_idx + 1} using sort order: {current_sort}")
+        status_callback(f"Fetching articles from {ds} to {de}")
     
     try:
-        # Get a fresh WebEnv with this specific sort order
+        # Get a fresh WebEnv for this date range
         search_params = {
             "db": "pubmed", 
             "term": term, 
             "usehistory": "y",
-            "retmax": chunk_size,
-            "sort": current_sort,
-            "api_key": API_KEY
+            "retmax": 0,
         }
         
         search_root = get_xml(ESearch_URL, search_params)
@@ -280,22 +252,7 @@ def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, pr
         
         if count == 0:
             if status_callback:
-                status_callback("No records found with this sort order.")
-            return []
-        
-        # Adjust chunk size if needed
-        actual_chunk_size = min(chunk_size, count)
-        
-        # Get IDs for all articles in this chunk
-        id_list = []
-        for id_node in search_root.findall("./IdList/Id"):
-            if id_node.text:
-                id_list.append(id_node.text)
-        
-        # Ensure we got IDs
-        if not id_list:
-            if status_callback:
-                status_callback("No article IDs found in search results.")
+                status_callback(f"No records found from {ds} to {de}")
             return []
             
         webenv = get_text(search_root, "./WebEnv")
@@ -303,22 +260,22 @@ def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, pr
         
         if not webenv or not query_key:
             if status_callback:
-                status_callback("Error: WebEnv or QueryKey not found in search results.")
+                status_callback("Error: WebEnv or QueryKey not found in search results")
             return []
         
         records = []
-        batch_count = math.ceil(actual_chunk_size / BATCH_SIZE)
+        batch_count = math.ceil(count / BATCH_SIZE)
         
-        # Fetch records for this chunk in batches
-        for batch_idx in range(0, actual_chunk_size, BATCH_SIZE):
+        # Fetch records in batches
+        for batch_idx in range(0, count, BATCH_SIZE):
             batch_start = batch_idx
-            batch_end = min(batch_start + BATCH_SIZE, actual_chunk_size)
-            batch_size_actual = batch_end - batch_start
+            batch_end = min(batch_start + BATCH_SIZE, count)
+            batch_size = batch_end - batch_start
             current_batch = batch_idx // BATCH_SIZE + 1
             
             if status_callback:
-                overall_progress = (batch_idx + batch_size_actual) / actual_chunk_size
-                status_callback(f"Fetching batch {current_batch}/{batch_count}: records {batch_start+1}-{batch_end}")
+                overall_progress = (batch_idx + batch_size) / count
+                status_callback(f"Fetching batch {current_batch}/{batch_count}: records {batch_start+1}-{batch_end} of {count}")
             
             try:
                 fetch_root = get_xml(EFetch_URL, {
@@ -326,7 +283,7 @@ def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, pr
                     "query_key": query_key,
                     "WebEnv": webenv,
                     "retstart": batch_start,
-                    "retmax": batch_size_actual,
+                    "retmax": batch_size,
                     "retmode": "xml"
                 })
                 
@@ -405,7 +362,7 @@ def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, pr
 
                 # Update progress
                 if progress_callback:
-                    progress_callback(min((batch_idx + batch_size_actual) / actual_chunk_size, 1.0))
+                    progress_callback(min((batch_idx + batch_size) / count, 1.0))
                 
                 # Small delay to respect rate limits - with API key we can make 10 requests/sec
                 time.sleep(0.1)
@@ -418,15 +375,29 @@ def fetch_pubmed_chunk_sorted(year, month, chunk_idx, chunk_size, sort_field, pr
                 continue
         
         if status_callback:
-            status_callback(f"Successfully retrieved {len(records)} articles for chunk {chunk_idx + 1}")
+            status_callback(f"Successfully retrieved {len(records)} articles from {ds} to {de}")
         
         return records
         
     except Exception as e:
-        logger.error(f"Error in fetch_pubmed_chunk_sorted: {str(e)}")
+        logger.error(f"Error in fetch_pubmed_by_date_range: {str(e)}")
         if status_callback:
             status_callback(f"Error: {str(e)}")
         raise
+
+def calculate_date_ranges(year, month):
+    """
+    Calculate date ranges for the given month, splitting into chunks of DAYS_PER_CHUNK days.
+    Returns a list of (start_day, end_day) tuples.
+    """
+    days_in_month = calendar.monthrange(year, month)[1]
+    date_ranges = []
+    
+    for start_day in range(1, days_in_month + 1, DAYS_PER_CHUNK):
+        end_day = min(start_day + DAYS_PER_CHUNK - 1, days_in_month)
+        date_ranges.append((start_day, end_day))
+    
+    return date_ranges
 
 def create_excel(df, include_styling=True):
     """Convert dataframe to Excel file in memory with optional styling"""
@@ -516,30 +487,6 @@ def create_excel(df, include_styling=True):
         output.seek(0)
         return output.getvalue()
 
-# ------------------ Utility to track and deduplicate PMIDs ------------------
-
-def ensure_unique_pmids(df, seen_pmids):
-    """
-    Filter dataframe to ensure no duplicate PMIDs across chunks.
-    Returns filtered dataframe and count of duplicates removed.
-    """
-    if df.empty:
-        return df, 0
-    
-    # Find duplicates
-    duplicate_mask = df['PMID'].isin(seen_pmids)
-    duplicate_count = duplicate_mask.sum()
-    
-    # Update seen PMIDs with new ones
-    new_pmids = set(df['PMID'].tolist())
-    seen_pmids.update(new_pmids)
-    
-    # Remove duplicates
-    if duplicate_count > 0:
-        df = df[~duplicate_mask]
-    
-    return df, duplicate_count
-
 # ------------------ Sidebar Form ------------------
 
 with st.sidebar:
@@ -567,25 +514,17 @@ with st.sidebar:
                                      help="Better formatting, but may be slower for large datasets")
         include_authors = st.checkbox("Include Authors", value=True)
         
-        max_chunks = st.number_input(
-            "Maximum Chunks to Process",
-            min_value=1,
-            max_value=30,
-            value=10,
-            help="Limit the number of chunks to process (each chunk is ~10,000 articles)"
-        )
-        
         submitted = st.form_submit_button("Fetch Articles")
     
     # PubMed API Info
     st.markdown("---")
-    st.markdown("### About Sorted Downloads")
-    st.markdown("""
-    - This app uses multiple sort orders to download articles in chunks
-    - Each chunk uses a different sort order to retrieve different articles
-    - Duplicates between chunks are automatically removed
-    - PubMed API limits each chunk to 10,000 articles
-    - All available chunks combined will include articles for the month
+    st.markdown("### About Date Range Downloads")
+    st.markdown(f"""
+    - This app divides the month into {DAYS_PER_CHUNK}-day periods
+    - Each chunk processes a different date range (no overlap)
+    - 30-day months will generate 6 chunks
+    - 31-day months will generate 7 chunks
+    - This ensures all articles are retrieved reliably
     """)
 
 # ------------------ Main App Logic ------------------
@@ -602,28 +541,23 @@ if submitted:
             st.markdown("---")
             st.success(f"Found {total_count:,} articles for {calendar.month_name[month]} {year}")
             
-            # Calculate number of chunks needed
-            num_chunks = min(max_chunks, math.ceil(total_count / CHUNK_SIZE))
+            # Calculate date ranges for this month
+            date_ranges = calculate_date_ranges(year, month)
             
-            if num_chunks > 1:
-                st.info(f"Articles will be downloaded in {num_chunks} separate files using different sort orders")
+            st.info(f"Articles will be downloaded in {len(date_ranges)} separate files by date ranges")
             
-            # Set to track PMIDs we've already seen to avoid duplicates
-            seen_pmids = set()
             all_chunks_article_count = 0
             
-            for chunk_idx in range(num_chunks):
-                st.markdown(f"### Processing Chunk {chunk_idx + 1} of {num_chunks}")
+            for chunk_idx, (start_day, end_day) in enumerate(date_ranges):
+                st.markdown(f"### Processing Date Range {start_day}-{end_day} {calendar.month_name[month]} {year}")
                 
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
                 
-                # Fetch chunk data using the current sort field
-                current_sort = SORT_FIELDS[chunk_idx % len(SORT_FIELDS)]
-                
+                # Fetch articles for this date range
                 try:
-                    records = fetch_pubmed_chunk_sorted(
-                        year, month, chunk_idx, CHUNK_SIZE, current_sort,
+                    records = fetch_pubmed_by_date_range(
+                        year, month, start_day, end_day,
                         progress_callback=lambda frac: progress_bar.progress(frac),
                         status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
                     )
@@ -632,56 +566,52 @@ if submitted:
                     df = pd.DataFrame(records)
                     
                     if not df.empty:
-                        # Remove duplicates from previous chunks
-                        df, duplicate_count = ensure_unique_pmids(df, seen_pmids)
-                        
                         # Remove authors column if not requested
                         if not include_authors and "Authors" in df.columns:
                             df = df.drop(columns=["Authors"])
-                        
-                        if duplicate_count > 0:
-                            status_text.markdown(f'<p class="status-message">Removed {duplicate_count} duplicate articles already found in previous chunks</p>', unsafe_allow_html=True)
                         
                         all_chunks_article_count += len(df)
                         
                         # Create Excel file
                         excel_data = create_excel(df, include_styling)
                         
+                        # Format date range for display
+                        date_format = lambda d: f"{year}-{month:02d}-{d:02d}"
+                        start_date = date_format(start_day)
+                        end_date = date_format(end_day)
+                        
                         # Create download section
                         st.markdown(f"""
                         <div class="chunk-card">
-                            <div class="chunk-title">Chunk {chunk_idx + 1}: Sorted by {current_sort}</div>
-                            <p>Contains {len(df):,} unique articles</p>
+                            <div class="chunk-title">Date Range: {start_date} to {end_date}</div>
+                            <p>Contains {len(df):,} articles</p>
                         </div>
                         """, unsafe_allow_html=True)
                         
                         st.download_button(
-                            label=f"⬇️ Download Chunk {chunk_idx + 1} ({len(df):,} articles)",
+                            label=f"⬇️ Download {start_day}-{end_day} {calendar.month_name[month]} ({len(df):,} articles)",
                             data=excel_data,
-                            file_name=f"pubmed_{calendar.month_name[month].lower()}{year}_{chunk_idx + 1}.xlsx",
+                            file_name=f"pubmed_{calendar.month_name[month].lower()}{year}_{start_day}-{end_day}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"download_btn_{chunk_idx}"
                         )
                         
                         # Preview data
-                        with st.expander(f"Preview Chunk {chunk_idx + 1}"):
+                        with st.expander(f"Preview {start_day}-{end_day} {calendar.month_name[month]}"):
                             df_display = df.copy()
                             st.dataframe(df_display.head(5), use_container_width=True)
                     else:
-                        st.warning(f"No new articles found in chunk {chunk_idx + 1} using sort: {current_sort}")
+                        st.warning(f"No articles found for days {start_day}-{end_day}")
                 
                 except Exception as e:
-                    st.error(f"🛑 Error processing chunk {chunk_idx + 1}: {str(e)}")
-                    logger.error(f"Error processing chunk {chunk_idx + 1}: {str(e)}")
+                    st.error(f"🛑 Error processing days {start_day}-{end_day}: {str(e)}")
+                    logger.error(f"Error processing days {start_day}-{end_day}: {str(e)}")
                     continue
             
             # Show summary
             st.markdown("---")
             percent_retrieved = min(100, (all_chunks_article_count / total_count) * 100)
-            st.success(f"Successfully retrieved {all_chunks_article_count:,} unique articles ({percent_retrieved:.1f}% of total {total_count:,})")
-            
-            if all_chunks_article_count < total_count:
-                st.info("To retrieve more articles, increase the 'Maximum Chunks to Process' setting and run again")
+            st.success(f"Successfully retrieved {all_chunks_article_count:,} articles ({percent_retrieved:.1f}% of total {total_count:,})")
             
     except Exception as e:
         st.error(f"🛑 An error occurred: {str(e)}")
