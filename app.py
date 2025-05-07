@@ -27,7 +27,7 @@ logger = logging.getLogger("pubmed_extractor")
 # ------------------ Page Config & Styling ------------------
 
 st.set_page_config(
-    page_title="PubMed Month Extractor",
+    page_title="PubMed Daily Extractor",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -106,10 +106,38 @@ st.markdown("""
         padding: 10px;
         margin-bottom: 16px;
     }
+    /* Style the daily cards container */
+    .daily-cards-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 16px;
+        margin-top: 20px;
+    }
+    /* Style each day card */
+    .day-card {
+        background-color: #1A237E;
+        border-radius: 8px;
+        padding: 16px;
+        height: 100%;
+    }
+    .day-title {
+        font-size: 1.1rem;
+        margin-bottom: 8px;
+        color: #BBDEFB;
+        font-weight: bold;
+    }
+    .count-badge {
+        background-color: #1976D2;
+        border-radius: 12px;
+        padding: 4px 10px;
+        font-size: 0.9rem;
+        margin-top: 8px;
+        display: inline-block;
+    }
 </style>
 
-<h1 class="main-header">PubMed Month Extractor</h1>
-<p class="text-centered">Select a year &amp; month, fetch all PubMed articles published then, and download as multiple .xlsx files</p>
+<h1 class="main-header">PubMed Daily Extractor</h1>
+<p class="text-centered">Select a year &amp; month, fetch all PubMed articles published each day, and download individual .xlsx files</p>
 """, unsafe_allow_html=True)
 
 # ------------------ PubMed API Config ------------------
@@ -124,8 +152,9 @@ MAX_RETRIES = 3  # Maximum number of retry attempts for API calls
 # The consistent API key to use for all requests
 API_KEY = "29d53109210e6c9cb4249426d56ada159108"
 
-# Number of days per chunk
-DAYS_PER_CHUNK = 5
+# Store article data in session state to avoid resetting
+if 'day_data' not in st.session_state:
+    st.session_state.day_data = {}
 
 # ------------------ Helper Functions ------------------
 
@@ -216,9 +245,9 @@ def is_future_date(date_str):
     except (ValueError, TypeError):
         return False
 
-def validate_article_date(article, year, month, start_day, end_day):
+def validate_article_date(article, year, month, day):
     """
-    Validate that the article's publication date falls within the requested range.
+    Validate that the article's publication date is exactly the specified day.
     Returns True if valid, False otherwise.
     """
     # Get the publication date from the article
@@ -232,32 +261,39 @@ def validate_article_date(article, year, month, start_day, end_day):
         # Parse the date
         pub_date_obj = datetime.datetime.strptime(pub_date, "%Y-%m-%d").date()
         
-        # Create date range boundaries
-        start_date = datetime.date(year, month, start_day)
-        end_date = datetime.date(year, month, end_day)
+        # Create the exact day we want
+        target_date = datetime.date(year, month, day)
         
         # Check if date is in the future (beyond today)
         today = datetime.date.today()
         if pub_date_obj > today:
             return False
         
-        # Check if publication date is within range
-        return start_date <= pub_date_obj <= end_date
+        # Check if publication date is exactly the target date
+        return pub_date_obj == target_date
     except ValueError:
         # If date parsing fails, exclude the article
         return False
 
 # ------------------ Core Fetch Functions ------------------
 
-def get_total_record_count(year, month):
+def get_total_record_count(year, month, day=None):
     """
-    Get the total number of PubMed articles for the given year/month.
+    Get the total number of PubMed articles for the given date.
+    If day is None, gets count for the entire month.
     """
-    # Build date range for the entire month
-    start = datetime.date(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    end = datetime.date(year, month, last_day)
-    ds, de = start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+    # Build date range
+    if day:
+        # Single day
+        date_obj = datetime.date(year, month, day)
+        ds = de = date_obj.strftime("%Y/%m/%d")
+    else:
+        # Entire month
+        start = datetime.date(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end = datetime.date(year, month, last_day)
+        ds, de = start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+    
     term = f'"{ds}"[pdat] : "{de}"[pdat]'
     
     try:
@@ -272,32 +308,27 @@ def get_total_record_count(year, month):
         logger.error(f"Error getting total record count: {str(e)}")
         raise
 
-def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callback=None, status_callback=None):
+def fetch_pubmed_for_day(year, month, day, progress_callback=None, status_callback=None):
     """
-    Fetch PubMed articles published in a specific date range within a month.
-    This allows retrieving different subsets of articles that don't overlap.
+    Fetch PubMed articles published on a specific day.
     """
-    # Build date range for this specific period
-    start = datetime.date(year, month, start_day)
-    end = datetime.date(year, month, end_day)
-    
-    # Ensure end date is not in the future
-    today = datetime.date.today()
-    if end > today:
-        end = today
-        if start > today:
-            if status_callback:
-                status_callback(f"Warning: The requested date range is in the future. No articles will be available.")
-            return []
-    
-    ds, de = start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
-    term = f'"{ds}"[pdat] : "{de}"[pdat]'
+    # Skip if already in session state
+    day_key = f"{day:02d}_{month:02d}_{year}"
+    if day_key in st.session_state.day_data:
+        if status_callback:
+            status_callback(f"Using previously fetched data for {day:02d}/{month:02d}/{year}")
+        return st.session_state.day_data[day_key]
+        
+    # Create the exact date string
+    date_obj = datetime.date(year, month, day)
+    ds = de = date_obj.strftime("%Y/%m/%d")
+    term = f'"{ds}"[pdat]'
     
     if status_callback:
-        status_callback(f"Fetching articles from {ds} to {de}")
+        status_callback(f"Fetching articles for {date_obj.strftime('%d/%m/%Y')}")
     
     try:
-        # Get a fresh WebEnv for this date range
+        # Get a fresh WebEnv for this day
         search_params = {
             "db": "pubmed", 
             "term": term, 
@@ -310,7 +341,7 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
         
         if count == 0:
             if status_callback:
-                status_callback(f"No records found from {ds} to {de}")
+                status_callback(f"No records found for {date_obj.strftime('%d/%m/%Y')}")
             return []
             
         webenv = get_text(search_root, "./WebEnv")
@@ -422,51 +453,54 @@ def fetch_pubmed_by_date_range(year, month, start_day, end_day, progress_callbac
                 if progress_callback:
                     progress_callback(min((batch_idx + batch_size) / count, 1.0))
                 
-                # Small delay to respect rate limits - with API key we can make 10 requests/sec
+                # Small delay to respect rate limits
                 time.sleep(0.1)
                     
             except Exception as e:
                 logger.error(f"Error in batch {current_batch}: {str(e)}")
                 if status_callback:
                     status_callback(f"Error in batch {current_batch}: {str(e)}")
-                # Continue with next batch instead of failing the entire chunk
+                # Continue with next batch instead of failing the entire day
                 continue
         
-        # Filter records by actual publication date to ensure they're within the requested range
+        # Filter records by actual publication date to ensure they're exactly on the requested day
         valid_records = []
         future_dates = 0
-        out_of_range = 0
+        wrong_dates = 0
         
         for record in all_records:
             if is_future_date(record.get("PublicationDate", "")):
                 future_dates += 1
                 continue
                 
-            if validate_article_date(record, year, month, start_day, end_day):
+            if validate_article_date(record, year, month, day):
                 valid_records.append(record)
             else:
-                out_of_range += 1
+                wrong_dates += 1
         
         # Report filtering results
         if status_callback:
             if future_dates > 0:
                 status_callback(f"Removed {future_dates} articles with future publication dates")
-            if out_of_range > 0:
-                status_callback(f"Removed {out_of_range} articles with dates outside the requested range")
-            status_callback(f"Successfully retrieved {len(valid_records)} valid articles from {ds} to {de}")
+            if wrong_dates > 0:
+                status_callback(f"Removed {wrong_dates} articles with dates other than {date_obj.strftime('%d/%m/%Y')}")
+            status_callback(f"Successfully retrieved {len(valid_records)} valid articles for {date_obj.strftime('%d/%m/%Y')}")
+        
+        # Store in session state
+        st.session_state.day_data[day_key] = valid_records
         
         return valid_records
         
     except Exception as e:
-        logger.error(f"Error in fetch_pubmed_by_date_range: {str(e)}")
+        logger.error(f"Error in fetch_pubmed_for_day: {str(e)}")
         if status_callback:
             status_callback(f"Error: {str(e)}")
         raise
 
-def calculate_date_ranges(year, month):
+def get_valid_days(year, month):
     """
-    Calculate date ranges for the given month, splitting into chunks of DAYS_PER_CHUNK days.
-    Returns a list of (start_day, end_day) tuples.
+    Get a list of valid days for the given month.
+    Excludes future days.
     """
     days_in_month = calendar.monthrange(year, month)[1]
     
@@ -480,13 +514,7 @@ def calculate_date_ranges(year, month):
     if year == today.year and month == today.month:
         days_in_month = min(days_in_month, today.day)
     
-    date_ranges = []
-    
-    for start_day in range(1, days_in_month + 1, DAYS_PER_CHUNK):
-        end_day = min(start_day + DAYS_PER_CHUNK - 1, days_in_month)
-        date_ranges.append((start_day, end_day))
-    
-    return date_ranges
+    return list(range(1, days_in_month + 1))
 
 def create_excel(df, include_styling=True):
     """Convert dataframe to Excel file in memory with optional styling"""
@@ -605,28 +633,31 @@ with st.sidebar:
         
         submitted = st.form_submit_button("Fetch Articles")
     
+    # Reset button to clear session data
+    if st.button("Reset All Data"):
+        st.session_state.day_data = {}
+        st.success("All cached data has been cleared!")
+    
     # PubMed API Info
     st.markdown("---")
-    st.markdown("### About Date Range Downloads")
-    st.markdown(f"""
-    - This app divides the month into {DAYS_PER_CHUNK}-day periods
-    - Each chunk processes a different date range (no overlap)
-    - Articles are filtered to ensure publication dates match the requested range
-    - Future publication dates are automatically excluded
-    - Only articles with valid, verified dates are included
+    st.markdown("### About Daily Downloads")
+    st.markdown("""
+    - Each file contains articles from a single day
+    - Files are named as DD_MM_YYYY.xlsx
+    - Data stays loaded in the session while you navigate
+    - Use the 'Reset All Data' button if needed
     """)
 
 # ------------------ Main App Logic ------------------
 
 if submitted:
-    # Get total record count first
-    try:
-        # Check if the requested month is in the future
-        today = datetime.date.today()
-        if year > today.year or (year == today.year and month > today.month):
-            st.warning(f"⚠️ {calendar.month_name[month]} {year} is in the future. No articles are available yet.")
-        else:
-            with st.spinner("Checking total article count..."):
+    # Check if the requested month is in the future
+    today = datetime.date.today()
+    if year > today.year or (year == today.year and month > today.month):
+        st.warning(f"⚠️ {calendar.month_name[month]} {year} is in the future. No articles are available yet.")
+    else:
+        try:
+            with st.spinner("Checking article counts..."):
                 total_count = get_total_record_count(year, month)
                 
             if total_count == 0:
@@ -639,91 +670,106 @@ if submitted:
                 if year == today.year and month == today.month:
                     st.markdown(f"""
                     <div class="warning-note">
-                    ⚠️ Note: {calendar.month_name[month]} {year} is the current month. Only articles published up to today ({today.strftime('%Y-%m-%d')}) will be available.
+                    ⚠️ Note: {calendar.month_name[month]} {year} is the current month. Only articles published up to today ({today.strftime('%d/%m/%Y')}) will be available.
                     </div>
                     """, unsafe_allow_html=True)
                 
-                # Calculate date ranges for this month
-                date_ranges = calculate_date_ranges(year, month)
+                # Get valid days for this month
+                valid_days = get_valid_days(year, month)
                 
-                if not date_ranges:
-                    st.warning(f"No valid date ranges for {calendar.month_name[month]} {year}. This may be a future month.")
+                if not valid_days:
+                    st.warning(f"No valid days for {calendar.month_name[month]} {year}. This may be a future month.")
                 else:
-                    st.info(f"Articles will be downloaded in {len(date_ranges)} separate files by date ranges")
+                    # Process each day
+                    st.subheader(f"Daily Articles for {calendar.month_name[month]} {year}")
                     
-                    all_chunks_article_count = 0
+                    # Create a grid layout to display days
+                    st.markdown('<div class="daily-cards-container">', unsafe_allow_html=True)
                     
-                    for chunk_idx, (start_day, end_day) in enumerate(date_ranges):
-                        st.markdown(f"### Processing Date Range {start_day}-{end_day} {calendar.month_name[month]} {year}")
-                        
+                    days_processed = 0
+                    total_articles = 0
+                    
+                    # First, fetch data for all days to populate session state
+                    day_data = {}
+                    
+                    for day in valid_days:
                         progress_bar = st.progress(0.0)
                         status_text = st.empty()
                         
-                        # Fetch articles for this date range
                         try:
-                            records = fetch_pubmed_by_date_range(
-                                year, month, start_day, end_day,
-                                progress_callback=lambda frac: progress_bar.progress(frac),
-                                status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
-                            )
+                            day_key = f"{day:02d}_{month:02d}_{year}"
+                            # Check session state first
+                            if day_key in st.session_state.day_data:
+                                records = st.session_state.day_data[day_key]
+                                status_text.markdown(f"<p class='status-message'>Using cached data for day {day}</p>", unsafe_allow_html=True)
+                            else:
+                                records = fetch_pubmed_for_day(
+                                    year, month, day,
+                                    progress_callback=lambda frac: progress_bar.progress(frac),
+                                    status_callback=lambda msg: status_text.markdown(f'<p class="status-message">{msg}</p>', unsafe_allow_html=True)
+                                )
                             
-                            # Convert to DataFrame
+                            # Store in temp dict
+                            day_data[day] = records
+                            days_processed += 1
+                            total_articles += len(records)
+                            
+                        except Exception as e:
+                            st.error(f"🛑 Error processing day {day}: {str(e)}")
+                            logger.error(f"Error processing day {day}: {str(e)}")
+                            continue
+                    
+                    # Now display all days in a grid
+                    for day in valid_days:
+                        day_key = f"{day:02d}_{month:02d}_{year}"
+                        if day_key in st.session_state.day_data:
+                            records = st.session_state.day_data[day_key]
+                            article_count = len(records)
+                            
+                            # Create DataFrame
                             df = pd.DataFrame(records)
                             
-                            if not df.empty:
-                                # Remove authors column if not requested
-                                if not include_authors and "Authors" in df.columns:
-                                    df = df.drop(columns=["Authors"])
-                                
-                                all_chunks_article_count += len(df)
-                                
-                                # Create Excel file
-                                excel_data = create_excel(df, include_styling)
-                                
-                                # Format date range for display
-                                date_format = lambda d: f"{year}-{month:02d}-{d:02d}"
-                                start_date = date_format(start_day)
-                                end_date = date_format(end_day)
-                                
-                                # Create download section
-                                st.markdown(f"""
-                                <div class="chunk-card">
-                                    <div class="chunk-title">Date Range: {start_date} to {end_date}</div>
-                                    <p>Contains {len(df):,} articles</p>
-                                </div>
-                                """, unsafe_allow_html=True)
-                                
-                                st.download_button(
-                                    label=f"⬇️ Download {start_day}-{end_day} {calendar.month_name[month]} ({len(df):,} articles)",
-                                    data=excel_data,
-                                    file_name=f"pubmed_{calendar.month_name[month].lower()}{year}_{start_day}-{end_day}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"download_btn_{chunk_idx}"
-                                )
-                                
-                                # Preview data
-                                with st.expander(f"Preview {start_day}-{end_day} {calendar.month_name[month]}"):
-                                    df_display = df.copy()
-                                    st.dataframe(df_display.head(5), use_container_width=True)
-                            else:
-                                st.warning(f"No valid articles found for days {start_day}-{end_day}")
-                        
-                        except Exception as e:
-                            st.error(f"🛑 Error processing days {start_day}-{end_day}: {str(e)}")
-                            logger.error(f"Error processing days {start_day}-{end_day}: {str(e)}")
-                            continue
+                            # Remove authors column if not requested
+                            if not df.empty and not include_authors and "Authors" in df.columns:
+                                df = df.drop(columns=["Authors"])
+                            
+                            # Create Excel file
+                            excel_data = create_excel(df, include_styling)
+                            
+                            # Create day card
+                            st.markdown(f"""
+                            <div class="day-card">
+                                <div class="day-title">{day:02d}/{month:02d}/{year}</div>
+                                <div class="count-badge">{article_count} articles</div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Add download button inside card
+                            st.download_button(
+                                label=f"⬇️ Download",
+                                data=excel_data,
+                                file_name=f"{day:02d}_{month:02d}_{year}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"download_btn_{day}"
+                            )
+                            
+                            # Preview button
+                            with st.expander("Preview"):
+                                if not df.empty:
+                                    st.dataframe(df.head(5), use_container_width=True)
+                                else:
+                                    st.info("No articles for this day")
+                            
+                            st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
                     
                     # Show summary
                     st.markdown("---")
-                    percent_retrieved = min(100, (all_chunks_article_count / total_count) * 100)
-                    st.success(f"Successfully retrieved {all_chunks_article_count:,} valid articles ({percent_retrieved:.1f}% of total {total_count:,})")
+                    st.success(f"Successfully retrieved {total_articles:,} articles across {days_processed} days")
                     
-                    if all_chunks_article_count < total_count:
-                        st.info("Note: The difference between the total count and retrieved articles is due to date filtering to ensure accurate results.")
-            
-    except Exception as e:
-        st.error(f"🛑 An error occurred: {str(e)}")
-        logger.error(f"Error in main app: {str(e)}")
+        except Exception as e:
+            st.error(f"🛑 An error occurred: {str(e)}")
+            logger.error(f"Error in main app: {str(e)}")
 
 # ------------------ Footer ------------------
 
